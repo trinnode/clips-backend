@@ -8,6 +8,7 @@ import * as bodyParser from 'body-parser';
 import * as fs from 'fs';
 import * as path from 'path';
 import { AppModule } from './app.module';
+import { RoyaltyConfigurationService } from './nft/royalty-configuration.service';
 import { PayoutsService } from './payouts/payouts.service';
 import { StellarWebhookService } from './subscriptions/stellar-webhook.service';
 import { MetricsInterceptor } from './metrics/metrics.interceptor';
@@ -49,6 +50,20 @@ async function bootstrap() {
     );
   } catch (error) {
     logger.error(`Invalid BullMQ worker configuration: ${error.message}`);
+    process.exit(1);
+  }
+
+  // Validate royalty configuration on startup
+  const royaltyConfigService = app.get(RoyaltyConfigurationService);
+  try {
+    royaltyConfigService.validateRoyaltyConfiguration();
+    logger.log(
+      `Royalty configuration validated: ` +
+        `creatorRoyaltyBps=${royaltyConfigService.getCreatorRoyaltyBps()}, ` +
+        `platformRoyaltyBps=${royaltyConfigService.getPlatformRoyaltyBps()}`,
+    );
+  } catch (error) {
+    logger.error(`Invalid royalty configuration: ${error.message}`);
     process.exit(1);
   }
 
@@ -119,6 +134,15 @@ async function bootstrap() {
     .addTag('stellar', 'Stellar network interactions')
     .addTag('jobs', 'Background job management')
     .addTag('platforms', 'Social platform integrations')
+    .addTag('admin', 'Admin-only endpoints')
+    .addTag('queues', 'BullMQ queue management')
+    .addTag('circuit-breaker', 'Circuit breaker monitoring and management')
+    .addTag('metrics', 'Prometheus metrics endpoint')
+    .addTag('user-platforms', 'Social platform connections')
+    .addTag('platform', 'Platform revenue queries')
+    .addTag('health', 'System health checks')
+    .addTag('transactions', 'Blockchain transactions')
+    .addTag('payout-methods', 'Payout method management')
     .build();
 
   const document = SwaggerModule.createDocument(app, swaggerConfig);

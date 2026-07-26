@@ -15,7 +15,10 @@ import { EncryptionModule } from '../encryption/encryption.module';
 import { MetricsModule } from '../metrics/metrics.module';
 import { PayoutRetryProcessor } from './payout-retry.processor';
 import { PAYOUT_RETRY_QUEUE, PAYOUT_RETRY_QUEUE_PRIORITY } from './payout-retry.queue';
+import { StellarConfirmationProcessor } from './stellar-confirmation.processor';
+import { STELLAR_CONFIRMATION_QUEUE } from './stellar-confirmation.queue';
 import { PayoutApprovalService } from './payout-approval.service';
+import { ConfigService } from '../config/config.service';
 
 @Module({
   imports: [
@@ -27,6 +30,9 @@ import { PayoutApprovalService } from './payout-approval.service';
     BullModule.registerQueue({
       name: PAYOUT_RETRY_QUEUE,
       defaultJobOptions: { priority: PAYOUT_RETRY_QUEUE_PRIORITY },
+    }),
+    BullModule.registerQueue({
+      name: STELLAR_CONFIRMATION_QUEUE,
     }),
   ],
   controllers: [
@@ -41,7 +47,9 @@ import { PayoutApprovalService } from './payout-approval.service';
     FeeService,
     PayoutMethodService,
     PayoutRetryProcessor,
+    StellarConfirmationProcessor,
     PayoutApprovalService,
+    ConfigService,
   ],
   exports: [PayoutsService, FeeService, PayoutMethodService],
 })

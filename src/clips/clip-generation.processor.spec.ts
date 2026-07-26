@@ -77,13 +77,22 @@ function makeProcessor() {
   jest.spyOn(emitter, 'emit');
   jest.spyOn(cloudinaryService, 'uploadVideoFromBuffer');
   jest.spyOn(cloudinaryService, 'deleteLocalFile');
+  const videoService = {
+    detectViralTimestamps: jest.fn().mockResolvedValue([]),
+  };
+  const shutdownService = {
+    register: jest.fn(),
+  };
+
   const processor = new ClipGenerationProcessor(
+    videoService as any,
     cloudinaryService as any,
     emitter,
     clipsGateway as any,
     clipsService as any,
     metricsService as any,
     prisma as any,
+    shutdownService as any,
   );
   return { processor, emitter, cloudinaryService, clipsService, prisma };
 }
@@ -220,10 +229,10 @@ describe('ClipGenerationProcessor', () => {
   });
 
   describe('CLIP_JOB_OPTIONS', () => {
-    it('configures 5 attempts with exponential backoff at 2000ms', () => {
-      expect(CLIP_JOB_OPTIONS.attempts).toBe(5);
+    it('configures 3 attempts with exponential backoff at 1000ms', () => {
+      expect(CLIP_JOB_OPTIONS.attempts).toBe(3);
       expect(CLIP_JOB_OPTIONS.backoff.type).toBe('exponential');
-      expect(CLIP_JOB_OPTIONS.backoff.delay).toBe(2000);
+      expect(CLIP_JOB_OPTIONS.backoff.delay).toBe(1000);
     });
   });
 });

@@ -7,9 +7,11 @@ import {
 import { WalletsService } from '../src/wallets/wallets.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { StellarService } from '../src/stellar/stellar.service';
+import { WalletManagementService } from '../src/wallets/wallet-management.service';
+import { WalletValidationService } from '../src/wallets/wallet-validation.service';
 
 jest.mock('../src/prisma/prisma.service', () => ({
-  PrismaService: class PrismaService {},
+  PrismaService: class PrismaService { },
 }));
 
 // A valid 56-char Stellar public key (G...)
@@ -18,11 +20,17 @@ const VALID_ADDRESS = 'GC6XOTK6L6LGBKIWH3IRUZPVUY4COGEMW4J5YINOSPKO27YKTUUHTZF3'
 class InMemoryPrisma {
   private wallets: any[] = [];
   private payouts: any[] = [];
+  private clips: any[] = [];
   private nextId = 1;
 
   wallet = {
     findUnique: jest.fn(async ({ where }) => {
-      return this.wallets.find((w) => w.id === where.id) ?? null;
+      const wallet = this.wallets.find((w) => w.id === where.id) ?? null;
+      if (!wallet) return null;
+      return {
+        ...wallet,
+        payouts: this.payouts.filter((p) => p.walletId === wallet.id),
+      };
     }),
     update: jest.fn(async ({ where, data }) => {
       const idx = this.wallets.findIndex((w) => w.id === where.id);
@@ -56,12 +64,39 @@ class InMemoryPrisma {
     }),
   };
 
+  clip = {
+    findFirst: jest.fn(async ({ where } = {}) => {
+      return (
+        this.clips.find((clip) => {
+          if (where?.video?.userId !== undefined && clip.userId !== where.video.userId) {
+            return false;
+          }
+          if (where?.OR?.length) {
+            return where.OR.some((condition) => {
+              if (condition.nftStatus !== undefined) {
+                return clip.nftStatus === condition.nftStatus;
+              }
+              if (condition.mintAddress?.not === null) {
+                return clip.mintAddress !== null;
+              }
+              return false;
+            });
+          }
+          return true;
+        }) ?? null
+      );
+    }),
+  };
+
   // Test helpers
   _seed(wallet: any) {
     this.wallets.push(wallet);
   }
   _seedPayout(payout: any) {
     this.payouts.push(payout);
+  }
+  _seedClip(clip: any) {
+    this.clips.push(clip);
   }
   _getWallets() {
     return this.wallets;
@@ -82,6 +117,8 @@ describe('Wallets integration', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         WalletsService,
+        WalletManagementService,
+        WalletValidationService,
         { provide: PrismaService, useValue: prisma },
         { provide: StellarService, useValue: stellarService },
       ],
@@ -98,7 +135,7 @@ describe('Wallets integration', () => {
       const result = await service.connect(1, dto);
 
       expect(result.id).toBeDefined();
-      expect(result.address).toBe(VALID_ADDRESS);
+      expect(result.address).toBe('GC6X********UHTZF3');
       expect(result.userId).toBe(1);
       expect(prisma._getWallets()).toHaveLength(1);
     });
@@ -187,6 +224,11 @@ describe('Wallets integration', () => {
 
     it('throws ConflictException when pending payouts exist on the wallet', async () => {
       prisma._seedPayout({ id: 1, walletId: 10, status: 'pending' });
+      await expect(service.disconnect(10, 42)).rejects.toThrow(ConflictException);
+    });
+
+    it('throws ConflictException when active NFTs exist', async () => {
+      prisma._seedClip({ id: 1, userId: 42, nftStatus: 'minted', mintAddress: 'CONTRACT' });
       await expect(service.disconnect(10, 42)).rejects.toThrow(ConflictException);
     });
 

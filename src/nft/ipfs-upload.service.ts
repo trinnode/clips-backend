@@ -10,6 +10,12 @@ export interface NftMetadataAttribute {
   value: string | number;
 }
 
+export interface NftRoyaltyInfo {
+  bps: number;
+  percent: number;
+  recipient?: string;
+}
+
 export interface NftMetadata {
   name: string;
   description: string;
@@ -17,6 +23,12 @@ export interface NftMetadata {
   animation_url: string;
   external_url?: string;
   attributes: NftMetadataAttribute[];
+  /** OpenSea-compatible creator royalty in basis points (e.g. 1000 = 10%). */
+  seller_fee_basis_points: number;
+  /** Optional royalty recipient (Stellar G... address when known). */
+  fee_recipient?: string;
+  /** Explicit royalty block for marketplaces / mint clients. */
+  royalty: NftRoyaltyInfo;
 }
 
 export type IpfsProvider = 'pinata' | 'nftstorage';
@@ -49,6 +61,69 @@ export class IpfsUploadService {
   ) {}
 
   /**
+   * Validates that metadata satisfies NFT standards before upload.
+   * Throws BadRequestException when required fields are absent or any
+   * attribute contains an empty trait_type or a null/undefined value.
+   */
+  validateMetadata(metadata: NftMetadata): void {
+    if (!metadata.name?.trim()) {
+      throw new BadRequestException(
+        'NFT metadata is missing required field: name',
+      );
+    }
+    if (!metadata.description?.trim()) {
+      throw new BadRequestException(
+        'NFT metadata is missing required field: description',
+      );
+    }
+    if (!metadata.image?.trim()) {
+      throw new BadRequestException(
+        'NFT metadata is missing required field: image',
+      );
+    }
+    if (!metadata.animation_url?.trim()) {
+      throw new BadRequestException(
+        'NFT metadata is missing required field: animation_url',
+      );
+    }
+    if (!Array.isArray(metadata.attributes)) {
+      throw new BadRequestException(
+        'NFT metadata attributes must be an array',
+      );
+    }
+    for (const attr of metadata.attributes) {
+      if (!attr.trait_type?.trim()) {
+        throw new BadRequestException(
+          'NFT metadata attribute has an empty trait_type',
+        );
+      }
+      if (attr.value === null || attr.value === undefined) {
+        throw new BadRequestException(
+          `NFT metadata attribute "${attr.trait_type}" has a null or undefined value`,
+        );
+      }
+    }
+    if (
+      typeof metadata.seller_fee_basis_points !== 'number' ||
+      !Number.isFinite(metadata.seller_fee_basis_points) ||
+      metadata.seller_fee_basis_points < 0
+    ) {
+      throw new BadRequestException(
+        'NFT metadata is missing required royalty field: seller_fee_basis_points',
+      );
+    }
+    if (
+      !metadata.royalty ||
+      typeof metadata.royalty.bps !== 'number' ||
+      typeof metadata.royalty.percent !== 'number'
+    ) {
+      throw new BadRequestException(
+        'NFT metadata is missing required royalty info (royalty.bps / royalty.percent)',
+      );
+    }
+  }
+
+  /**
    * Upload NFT metadata JSON to IPFS via Pinata or nft.storage.
    * Returns an ipfs:// URI for the pinned content.
    */
@@ -56,6 +131,7 @@ export class IpfsUploadService {
     metadata: NftMetadata,
     clipId: number,
   ): Promise<string> {
+    this.validateMetadata(metadata);
     const provider = this.resolveProvider();
 
     return this.circuitBreakerService.execute(

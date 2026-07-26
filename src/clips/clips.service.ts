@@ -3,6 +3,7 @@ import {
   Logger,
   ForbiddenException,
   BadRequestException,
+  NotFoundException,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -47,8 +48,8 @@ export interface PaginatedClips {
 
 export interface BulkUpdateResult {
   updatedCount: number;
-  updates: { selected?: boolean; postStatus?: unknown };
-  notFoundIds: string[];
+  updates: { selected?: boolean; postStatus?: unknown; caption?: string; royaltyBps?: number };
+  notFoundIds: number[];
   allClipsProcessed: boolean;
 }
 
@@ -133,13 +134,23 @@ export class ClipsService {
     userId: number,
     clipId: number,
   ): Promise<{ jobId: string | undefined }> {
-    // Performance: Use select to fetch only userId for authorization check (optimization #326)
     const clip = await this.prisma.clip.findUnique({
       where: { id: clipId },
       select: {
         id: true,
+        videoId: true,
+        startTime: true,
+        endTime: true,
+        viralityScore: true,
+        caption: true,
+        title: true,
+        clipUrl: true,
         video: {
-          select: { userId: true },
+          select: {
+            userId: true,
+            sourceUrl: true,
+            duration: true,
+          },
         },
       },
     });
@@ -163,15 +174,16 @@ export class ClipsService {
     // Enqueue the job
     const job: ClipGenerationJob = {
       videoId: String(clip.videoId),
-      inputPath: clip.video.sourceUrl, // Assuming sourceUrl is the local path or accessible URL
+      inputPath: clip.video.sourceUrl,
       outputPath: `/tmp/clip-${clipId}-regen-${Date.now()}.mp4`,
       startTime: clip.startTime,
       endTime: clip.endTime,
-      positionRatio: clip.startTime / (clip.video.duration || 1), // Rough estimate if not stored
-      transcript: clip.caption || '', // Use caption as transcript fallback
+      positionRatio: clip.startTime / (clip.video.duration || 1),
+      transcript: clip.caption || '',
       title: clip.title || undefined,
       clipId: clip.id,
       existingViralityScore: clip.viralityScore || undefined,
+      existingClipUrl: clip.clipUrl || undefined,
     };
 
     return this.enqueueClip(job);
@@ -202,17 +214,39 @@ export class ClipsService {
       `Clip generation failed for video ${payload.videoId}: ${payload.failedReason}`,
     );
 
+    if (this._isVideoCancelled(payload.videoId) || payload.failedReason === 'Cancelled by user') {
+      this.logger.log(`Video ${payload.videoId} was cancelled, skipping failed status update.`);
+      return;
+    }
+
     // Update Video status and processingError in Prisma
     try {
-      await this.prisma.video.update({
+      const video = await this.prisma.video.findUnique({
         where: { id: Number(payload.videoId) },
-        data: {
-          status: 'failed',
-          processingError: payload.failedReason,
-          updatedAt: new Date(),
-        },
+        select: { status: true, processingStats: true },
       });
-      this.logger.log(`Video ${payload.videoId} marked as failed in database`);
+
+      if (video && video.status !== 'cancelled') {
+        const currentStats = (video.processingStats as Record<string, any>) || {};
+        await this.prisma.video.update({
+          where: { id: Number(payload.videoId) },
+          data: {
+            status: 'failed',
+            processingError: payload.failedReason,
+            processingStats: {
+              ...currentStats,
+              errorDetails: payload.failedReason,
+              momentsFound: currentStats.momentsFound ?? 0,
+              inputQuality: currentStats.inputQuality ?? 'unknown',
+              durationSec: currentStats.durationSec ?? 0,
+              clipsGenerated: currentStats.clipsGenerated ?? 0,
+              timeTakenMs: currentStats.timeTakenMs ?? 0,
+            },
+            updatedAt: new Date(),
+          },
+        });
+        this.logger.log(`Video ${payload.videoId} marked as failed in database`);
+      }
     } catch (error) {
       this.logger.error(
         `Failed to update video ${payload.videoId} status: ${error.message}`,
@@ -237,9 +271,11 @@ export class ClipsService {
     userId: number,
     dto: BulkUpdateClipsDto,
   ): Promise<BulkUpdateResult> {
-    if (dto.selected === undefined && dto.postStatus === undefined && dto.royaltyBps === undefined && dto.caption === undefined) {
+    const { updates } = dto;
+    
+    if (!updates || (updates.selected === undefined && updates.postStatus === undefined && updates.royaltyBps === undefined && updates.caption === undefined)) {
       throw new BadRequestException(
-        'At least one of selected, postStatus, royaltyBps, or caption must be provided',
+        'At least one of selected, postStatus, royaltyBps, or caption must be provided in updates',
       );
     }
 
@@ -247,7 +283,7 @@ export class ClipsService {
     // Performance: Use select to fetch only id for ownership validation (optimization #326)
     let clips = await this.prisma.clip.findMany({
       where: {
-        id: { in: dto.clipIds.map((id) => Number(id)) },
+        id: { in: dto.clipIds },
         video: { userId },
       },
       select: { id: true },
@@ -262,7 +298,7 @@ export class ClipsService {
         .map((clip) => ({ ...clip, video: { userId } }));
     }
 
-    const foundIds = clips.map((c) => String(c.id));
+    const foundIds = clips.map((c) => Number(c.id));
     const notFoundIds = dto.clipIds.filter((id) => !foundIds.includes(id));
 
     if (clips.length === 0 && dto.clipIds.length > 0) {
@@ -275,10 +311,10 @@ export class ClipsService {
     const patch: any = {
       updatedAt: new Date(),
     };
-    if (dto.selected !== undefined) patch.selected = dto.selected;
-    if (dto.postStatus !== undefined) patch.postStatus = dto.postStatus;
-    if (dto.caption !== undefined) patch.caption = dto.caption;
-    if (dto.royaltyBps !== undefined) patch.royaltyBps = dto.royaltyBps;
+    if (updates.selected !== undefined) patch.selected = updates.selected;
+    if (updates.postStatus !== undefined) patch.postStatus = updates.postStatus;
+    if (updates.caption !== undefined) patch.caption = updates.caption;
+    if (updates.royaltyBps !== undefined) patch.royaltyBps = updates.royaltyBps;
 
     if (this.seededClips.size > 0) {
       clips.forEach((clip) => {
@@ -329,9 +365,10 @@ export class ClipsService {
     return {
       updatedCount: clips.length,
       updates: {
-        ...(dto.selected !== undefined && { selected: dto.selected }),
-        ...(dto.postStatus !== undefined && { postStatus: dto.postStatus }),
-        ...(dto.royaltyBps !== undefined && { royaltyBps: dto.royaltyBps }),
+        ...(updates.selected !== undefined && { selected: updates.selected }),
+        ...(updates.postStatus !== undefined && { postStatus: updates.postStatus }),
+        ...(updates.royaltyBps !== undefined && { royaltyBps: updates.royaltyBps }),
+        ...(updates.caption !== undefined && { caption: updates.caption }),
       },
       notFoundIds,
       allClipsProcessed,
@@ -342,7 +379,7 @@ export class ClipsService {
    * Find clips for a specific video, or all clips.
    */
   async listClips(options: ListClipsOptions = {}): Promise<PaginatedClips> {
-    const { videoId, sortBy = 'viralityScore', order = 'desc', page = 1, limit = 20 } = options;
+    const { videoId, sortBy = 'createdAt', order = 'desc', page = 1, limit = 20 } = options;
 
     if (limit < 1 || limit > 100) {
       throw new BadRequestException('limit must be between 1 and 100');
@@ -355,10 +392,21 @@ export class ClipsService {
     if (videoId) where.videoId = Number(videoId);
 
     const orderBy: any = [];
-    if (sortBy === 'viralityScore') orderBy.push({ viralityScore: order });
-    else if (sortBy === 'createdAt') orderBy.push({ createdAt: order });
-    else if (sortBy === 'duration') orderBy.push({ duration: order });
-    if (sortBy !== 'createdAt') orderBy.push({ createdAt: 'desc' });
+    if (sortBy === 'viralityScore') {
+      orderBy.push({
+        viralityScore: {
+          sort: order,
+          nulls: 'last',
+        },
+      });
+    } else if (sortBy === 'createdAt') {
+      orderBy.push({ createdAt: order });
+    } else if (sortBy === 'duration') {
+      orderBy.push({ duration: order });
+    }
+    if (sortBy !== 'createdAt') {
+      orderBy.push({ createdAt: 'desc' });
+    }
 
     const [total, data] = await Promise.all([
       this.prisma.clip.count({ where }),
@@ -374,16 +422,35 @@ export class ClipsService {
   }
 
   async bulkDeleteRejected(userId: number, clipIds: number[]) {
-    const clips = await this.prisma.clip.findMany({
+    let clips = await this.prisma.clip.findMany({
       where: {
         id: { in: clipIds },
-        video: { userId },
       },
       select: {
         id: true,
         clipUrl: true,
+        video: {
+          select: {
+            userId: true,
+          },
+        },
       },
     });
+
+    if ((clips.length === 0 || !clips) && this.seededClips.size > 0) {
+      clips = clipIds
+        .map((id) => this.seededClips.get(String(id)))
+        .filter((clip) => clip)
+        .map((clip) => ({ ...clip, video: { userId: Number(clip.userId) } }));
+    }
+
+    for (const clip of clips) {
+      if (clip.video.userId !== userId) {
+        throw new ForbiddenException(
+          `You do not have permission to delete clip ${clip.id}`,
+        );
+      }
+    }
 
     const foundIds = clips.map((clip) => clip.id);
     const notFoundIds = clipIds.filter((id) => !foundIds.includes(id));
@@ -399,7 +466,6 @@ export class ClipsService {
     const deleteResult = await this.prisma.clip.deleteMany({
       where: {
         id: { in: foundIds },
-        video: { userId },
       },
     });
 
@@ -471,9 +537,115 @@ export class ClipsService {
     return this.cancelledVideos.has(videoId);
   }
 
+  async updateCaption(
+    id: number,
+    userId: number,
+    caption: string,
+  ): Promise<{ id: number; caption: string }> {
+    const clip = await this.prisma.clip.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        video: { select: { userId: true } },
+      },
+    });
+
+    if (!clip) {
+      throw new BadRequestException(`Clip ${id} not found`);
+    }
+
+    if (clip.video.userId !== userId) {
+      throw new ForbiddenException('You do not have permission to update this clip');
+    }
+
+    await this.prisma.clip.update({
+      where: { id },
+      data: { caption, updatedAt: new Date() },
+    });
+
+    this.logger.log(`Clip ${id} caption updated`);
+    return { id, caption };
+  }
+
+  /**
+   * Persist NFT royalty BPS on a clip owned by the authenticated user.
+   * Validated range is 0–1500; callers should pass DTO-validated values.
+   */
+  async updateRoyalty(
+    id: number,
+    userId: number,
+    royaltyBps: number,
+  ): Promise<{ id: number; royaltyBps: number }> {
+    const clip = await this.prisma.clip.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        nftStatus: true,
+        mintAddress: true,
+        video: { select: { userId: true } },
+      },
+    });
+
+    if (!clip) {
+      throw new NotFoundException(`Clip ${id} not found`);
+    }
+
+    if (clip.video.userId !== userId) {
+      throw new ForbiddenException('You do not have permission to update this clip');
+    }
+
+    if (clip.nftStatus === 'minted' || clip.nftStatus === 'minting' || clip.mintAddress) {
+      throw new BadRequestException(
+        'Cannot change royalty after minting has started or completed',
+      );
+    }
+
+    await this.prisma.clip.update({
+      where: { id },
+      data: { royaltyBps, updatedAt: new Date() },
+    });
+
+    this.logger.log(`Clip ${id} royaltyBps updated to ${royaltyBps}`);
+    return { id, royaltyBps };
+  }
+
   async cancelVideo(
     videoId: string,
+    userId?: number,
   ): Promise<{ cancelled: boolean; removedJobs: number; abortedJobs: number }> {
+    const video = await this.prisma.video.findUnique({
+      where: { id: Number(videoId) },
+    }).catch(() => null);
+
+    if (video) {
+      if (userId !== undefined && video.userId !== userId) {
+        throw new ForbiddenException(
+          'You do not have permission to cancel this video',
+        );
+      }
+      await this.prisma.video.update({
+        where: { id: Number(videoId) },
+        data: {
+          status: 'cancelled',
+          updatedAt: new Date(),
+        },
+      });
+    } else {
+      // In-memory or legacy fallback
+      const legacyVideo = this.videos.get(videoId);
+      if (legacyVideo) {
+        if (userId !== undefined && legacyVideo.userId !== userId) {
+          throw new ForbiddenException(
+            'You do not have permission to cancel this video',
+          );
+        }
+        legacyVideo.status = 'cancelled';
+        legacyVideo.updatedAt = new Date();
+      } else {
+        throw new NotFoundException(`Video ${videoId} not found`);
+      }
+    }
+
     this.cancelledVideos.add(videoId);
     const jobIds = [...(this.videoJobs.get(videoId) ?? new Set<string>())];
     let removedJobs = 0;

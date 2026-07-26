@@ -28,7 +28,9 @@ describe('IpfsUploadService', () => {
     description: 'Test clip',
     image: 'https://cdn.example.com/thumb.jpg',
     animation_url: 'https://cdn.example.com/video.mp4',
-    attributes: [{ trait_type: 'royaltyBps', value: 1000 }],
+    attributes: [{ trait_type: 'Royalty BPS', value: 1000 }],
+    seller_fee_basis_points: 1000,
+    royalty: { bps: 1000, percent: 10 },
   };
 
   beforeEach(() => {
@@ -111,5 +113,139 @@ describe('IpfsUploadService', () => {
     await expect(service.uploadMetadata(sampleMetadata, 5)).rejects.toBeInstanceOf(
       BadRequestException,
     );
+  });
+
+  describe('validateMetadata', () => {
+    let service: IpfsUploadService;
+
+    beforeEach(() => {
+      service = createService();
+    });
+
+    const validMetadata: NftMetadata = {
+      name: 'Clip #1',
+      description: 'Test clip description',
+      image: 'https://cdn.example.com/thumb.jpg',
+      animation_url: 'https://cdn.example.com/video.mp4',
+      attributes: [
+        { trait_type: 'Clip Duration', value: 45 },
+        { trait_type: 'Virality Score', value: 92 },
+        { trait_type: 'Creation Date', value: '2026-06-25T12:00:00Z' },
+        { trait_type: 'Platforms Posted To', value: 'TikTok, Instagram' },
+      ],
+      seller_fee_basis_points: 1000,
+      royalty: { bps: 1000, percent: 10 },
+    };
+
+    it('does not throw for valid metadata', () => {
+      expect(() => service.validateMetadata(validMetadata)).not.toThrow();
+    });
+
+    it('throws BadRequestException when name is empty', () => {
+      expect(() =>
+        service.validateMetadata({ ...validMetadata, name: '' }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when name is whitespace only', () => {
+      expect(() =>
+        service.validateMetadata({ ...validMetadata, name: '   ' }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when description is empty', () => {
+      expect(() =>
+        service.validateMetadata({ ...validMetadata, description: '' }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when image is empty', () => {
+      expect(() =>
+        service.validateMetadata({ ...validMetadata, image: '' }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when animation_url is empty', () => {
+      expect(() =>
+        service.validateMetadata({ ...validMetadata, animation_url: '' }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when attributes is not an array', () => {
+      expect(() =>
+        service.validateMetadata({ ...validMetadata, attributes: null as any }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when an attribute has an empty trait_type', () => {
+      expect(() =>
+        service.validateMetadata({
+          ...validMetadata,
+          attributes: [{ trait_type: '', value: 42 }],
+        }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when an attribute has a null value', () => {
+      expect(() =>
+        service.validateMetadata({
+          ...validMetadata,
+          attributes: [{ trait_type: 'Clip Duration', value: null as any }],
+        }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException when an attribute has an undefined value', () => {
+      expect(() =>
+        service.validateMetadata({
+          ...validMetadata,
+          attributes: [{ trait_type: 'Virality Score', value: undefined as any }],
+        }),
+      ).toThrow(BadRequestException);
+    });
+
+    it('accepts numeric zero as a valid attribute value', () => {
+      expect(() =>
+        service.validateMetadata({
+          ...validMetadata,
+          attributes: [{ trait_type: 'Virality Score', value: 0 }],
+        }),
+      ).not.toThrow();
+    });
+
+    it('accepts empty string as a valid attribute value (e.g. no platforms posted)', () => {
+      expect(() =>
+        service.validateMetadata({
+          ...validMetadata,
+          attributes: [{ trait_type: 'Platforms Posted To', value: '' }],
+        }),
+      ).not.toThrow();
+    });
+
+    it('rejects metadata before upload when validation fails', async () => {
+      const invalidMetadata = { ...validMetadata, name: '' };
+      await expect(service.uploadMetadata(invalidMetadata, 99)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it('uploads when all required fields and attributes are valid', async () => {
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => ({ IpfsHash: 'bafyValidCid' }),
+      });
+
+      const uri = await service.uploadMetadata(validMetadata, 10);
+      expect(uri).toBe('ipfs://bafyValidCid');
+    });
+
+    it('throws when royalty info is missing', () => {
+      const { royalty: _royalty, seller_fee_basis_points: _bps, ...rest } =
+        validMetadata;
+      expect(() =>
+        service.validateMetadata(rest as NftMetadata),
+      ).toThrow(BadRequestException);
+    });
   });
 });

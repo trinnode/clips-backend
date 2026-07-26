@@ -67,6 +67,16 @@ export class NftMintService {
       );
     }
 
+    const royaltyBps = this.royaltyConfigurationService.getCreatorRoyaltyBps(
+      clip.royaltyBps,
+    );
+    let royaltyRecipient: string | undefined;
+    try {
+      royaltyRecipient = this.royaltyConfigurationService.getPlatformWallet();
+    } catch {
+      royaltyRecipient = undefined;
+    }
+
     const metadata = this.buildMetadata({
       id: clip.id,
       title: clip.title,
@@ -77,9 +87,8 @@ export class NftMintService {
       viralityScore: clip.viralityScore,
       createdAt: clip.createdAt,
       postStatus: clip.postStatus,
-      royaltyBps: this.royaltyConfigurationService.getCreatorRoyaltyBps(
-        clip.royaltyBps,
-      ),
+      royaltyBps,
+      royaltyRecipient,
     });
 
     const metadataUri = await this.ipfsUploadService.uploadMetadata(
@@ -162,6 +171,10 @@ export class NftMintService {
       );
     }
 
+    if (clip.mintAddress) {
+      throw new BadRequestException('Clip has already been minted on-chain');
+    }
+
     // Prevent minting of posted clips
     const isPosted = clip.postStatus === 'posted' || 
       clip.clipPosts.some(post => post.status === 'published');
@@ -176,10 +189,16 @@ export class NftMintService {
       );
     }
 
-    // Set minting state before blockchain interaction
+    // Set minting state before blockchain interaction; persist resolved royalty default
+    const resolvedRoyaltyBps =
+      this.royaltyConfigurationService.getCreatorRoyaltyBps(clip.royaltyBps);
+
     await this.prisma.clip.update({
       where: { id: clipId },
-      data: { nftStatus: 'minting' },
+      data: {
+        nftStatus: 'minting',
+        royaltyBps: resolvedRoyaltyBps,
+      },
     });
 
     try {
@@ -200,7 +219,7 @@ export class NftMintService {
 
       const royaltyMapEntries = this.royaltyConfigurationService.buildRoyaltyMap(
         walletAddress,
-        clip.royaltyBps,
+        resolvedRoyaltyBps,
       );
 
       const op = contract.call(
@@ -228,6 +247,7 @@ export class NftMintService {
         clipId: clip.id,
         tokenId: clip.id,
         metadataUri,
+        royaltyBps: resolvedRoyaltyBps,
         to: walletAddress,
         contractId: this.CONTRACT_ID,
         network: this.stellarService.network,
@@ -277,18 +297,19 @@ export class NftMintService {
     createdAt: Date;
     postStatus: unknown;
     royaltyBps: number;
+    royaltyRecipient?: string | null;
   }): NftMetadata {
     const platforms = this.extractPlatforms(clip.postStatus);
+    const viralityScore = clip.viralityScore ?? 0;
+    const royaltyRecipient = clip.royaltyRecipient?.trim() || undefined;
+
     const attributes: NftAttribute[] = [
-      { trait_type: 'clipDuration', value: clip.duration },
-      { trait_type: 'viralityScore', value: clip.viralityScore ?? 0 },
-      { trait_type: 'createdAt', value: clip.createdAt.toISOString() },
-      { trait_type: 'royaltyBps', value: clip.royaltyBps },
-      { trait_type: 'royaltyPercent', value: clip.royaltyBps / 100 },
-      {
-        trait_type: 'platformsPosted',
-        value: platforms.length ? platforms.join(',') : 'none',
-      },
+      { trait_type: 'Clip Duration', value: clip.duration },
+      { trait_type: 'Virality Score', value: viralityScore },
+      { trait_type: 'Creation Date', value: clip.createdAt.toISOString() },
+      { trait_type: 'Royalty BPS', value: clip.royaltyBps },
+      { trait_type: 'Royalty Percent', value: clip.royaltyBps / 100 },
+      { trait_type: 'Platforms Posted To', value: platforms.join(', ') },
     ];
 
     return {
@@ -297,6 +318,13 @@ export class NftMintService {
       image: clip.thumbnail || clip.clipUrl,
       animation_url: clip.clipUrl,
       attributes,
+      seller_fee_basis_points: clip.royaltyBps,
+      ...(royaltyRecipient ? { fee_recipient: royaltyRecipient } : {}),
+      royalty: {
+        bps: clip.royaltyBps,
+        percent: clip.royaltyBps / 100,
+        ...(royaltyRecipient ? { recipient: royaltyRecipient } : {}),
+      },
     };
   }
 
@@ -325,6 +353,19 @@ export class NftMintService {
     this.logger.log(`Confirming mint for clip ${clipId} with contract ${contractId}`);
 
     try {
+      const existingClip = await this.prisma.clip.findUnique({
+        where: { id: clipId },
+        select: { nftStatus: true, mintAddress: true },
+      });
+
+      if (!existingClip) {
+        throw new NotFoundException(`Clip with ID ${clipId} not found`);
+      }
+
+      if (existingClip.nftStatus === 'minted' || existingClip.mintAddress) {
+        throw new BadRequestException('Clip has already been minted on-chain');
+      }
+
       const clip = await this.prisma.clip.update({
         where: { id: clipId },
         data: {
